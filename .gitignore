@@ -20,6 +20,10 @@ var/
 .installed.cfg
 *.egg
 
+# macOS specific files
+.DS_Store
+.AppleDouble
+
 # Virtual Environment
 venv/
 ENV/
