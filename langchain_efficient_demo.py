@@ -33,6 +33,9 @@ class AwsLangChainBot:
         self.query_cache_path = os.path.join(cache_dir, "query_cache.pickle")
         os.makedirs(cache_dir, exist_ok=True)
         
+        # Force reload environment variables to ensure we have the latest credentials
+        load_dotenv(override=True)
+        
         # AWS configuration from environment
         self.aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
         self.aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -41,7 +44,14 @@ class AwsLangChainBot:
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         
         # Initialize AWS clients
-        self.initialize_aws_clients()
+        try:
+            self.initialize_aws_clients()
+        except Exception as e:
+            if "AWS credentials expired" in str(e):
+                print("⚠️ AWS credentials appear to be expired. Using sample data instead.")
+                # Don't initialize AWS clients, we'll use sample data
+            else:
+                raise
         
         # Initialize LangChain components with updated imports
         self.embeddings = OpenAIEmbeddings(openai_api_key=self.openai_api_key)
@@ -534,15 +544,15 @@ class AwsLangChainBot:
             retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
             print(f"Retriever created: {type(retriever)}")
             
-            # Fix the QA chain creation by removing the memory_key parameter
+            # Fix: Specify memory_key and output_key properly
             self.qa_chain = ConversationalRetrievalChain.from_llm(
                 llm=ChatOpenAI(temperature=0, openai_api_key=self.openai_api_key, model="gpt-4"),
                 retriever=retriever,
                 memory=self.memory,
                 verbose=True,
                 return_source_documents=True,
-                # Keep this line for output_key
-                output_key="answer"
+                output_key="answer",
+                memory_key="chat_history"  # Make sure this matches the memory's memory_key
             )
             
             print("✅ Initialization complete - ask questions about contracts and contacts!")
