@@ -81,7 +81,7 @@ class AwsLangChainBot:
             
             # Test the connection with more robust error handling
             try:
-                self.athena_client.list_data_catalogs()
+                self.athena_client.list_work_groups()
                 print("✅ AWS credentials are valid")
                 self.aws_clients_initialized = True
                 return True
@@ -243,7 +243,7 @@ class AwsLangChainBot:
         key = f"{query}_{database}"
         return hashlib.md5(key.encode()).hexdigest()
     
-    def run_athena_query(self, query, database="demo"):
+    def run_athena_query(self, query, database="demo", catalog_name="AwsDataCatalog"):
         """Run Athena query and return DataFrame with caching and automatic OAuth refresh"""
         cache_key = self.get_cache_key(query, database)
         
@@ -264,7 +264,9 @@ class AwsLangChainBot:
             
             # Verify the database exists before running the query
             try:
-                databases = self.athena_client.list_databases()
+                databases = self.athena_client.list_databases(
+                    CatalogName=catalog_name
+                )
                 db_names = [db['Name'] for db in databases['DatabaseList']]
                 if database not in db_names:
                     print(f"⚠️ Database '{database}' not found. Available databases: {', '.join(db_names)}")
@@ -274,7 +276,7 @@ class AwsLangChainBot:
                     if self.refresh_aws_credentials_oauth():
                         print("✅ Credentials refreshed automatically via OAuth")
                         # Retry the query after refreshing
-                        return self.run_athena_query(query, database)
+                        return self.run_athena_query(query, database, catalog_name)
                     else:
                         raise Exception("AWS credentials expired and refresh failed.")
                 raise
@@ -282,7 +284,10 @@ class AwsLangChainBot:
             # Start the query execution
             query_execution = self.athena_client.start_query_execution(
                 QueryString=query,
-                QueryExecutionContext={'Database': database},
+                QueryExecutionContext={
+                    'Database': database,
+                    'Catalog': catalog_name
+                },
                 ResultConfiguration={
                    'OutputLocation': s3_output_location
                 }
@@ -329,7 +334,7 @@ class AwsLangChainBot:
                     print("⚠️ AWS token expired while getting results. Attempting to refresh...")
                     if self.refresh_aws_credentials_oauth():
                         print("✅ Credentials refreshed, retrying...")
-                        return self.run_athena_query(query, database)
+                        return self.run_athena_query(query, database, catalog_name)
                     else:
                         raise Exception("AWS credentials expired and refresh failed.")
                 else:
@@ -357,7 +362,7 @@ class AwsLangChainBot:
                 if self.refresh_aws_credentials_oauth():
                     print("✅ Credentials refreshed, retrying query...")
                     # Retry the query with refreshed credentials
-                    return self.run_athena_query(query, database)
+                    return self.run_athena_query(query, database, catalog_name)
                 else:
                     print("❌ OAuth refresh failed.")
             
@@ -372,7 +377,7 @@ class AwsLangChainBot:
             # Try to fetch data from AWS
             try:
                 # Test AWS connection
-                self.athena_client.list_data_catalogs()
+                self.athena_client.list_work_groups()
                 aws_available = True
             except Exception as e:
                 print(f"⚠️ AWS connection error: {str(e)}")
@@ -381,7 +386,7 @@ class AwsLangChainBot:
                     if self.refresh_aws_credentials_oauth():
                         print("✅ Credentials refreshed, trying again...")
                         try:
-                            self.athena_client.list_data_catalogs()
+                            self.athena_client.list_work_groups()
                             aws_available = True
                         except Exception as e2:
                             print(f"⚠️ Still can't connect to AWS after refresh: {str(e2)}")
@@ -729,7 +734,7 @@ class AwsLangChainBot:
                 memory=self.memory,
                 verbose=True,
                 return_source_documents=True,
-                output_key="answer"
+                output_key="answer"  # This tells the chain which key to use as the main output
             )
             
             print("✅ Initialization complete - ask questions about contracts and contacts!")
@@ -843,8 +848,8 @@ class AwsLangChainBot:
         # Step 1: Check AWS credentials
         print("\n--- Step 1: AWS Credential Check ---")
         try:
-            catalogs = self.athena_client.list_data_catalogs()
-            print(f"✅ AWS credentials are valid - found {len(catalogs['DataCatalogsSummary'])} data catalogs")
+            catalogs = self.athena_client.list_work_groups()
+            print(f"✅ AWS credentials are valid - found {len(catalogs['WorkGroups'])} work groups")
         except Exception as e:
             error_str = str(e).lower()
             if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
@@ -1015,7 +1020,7 @@ class AwsLangChainBot:
         try:
             # List all databases
             print("Discovering available databases...")
-            databases = self.athena_client.list_databases()
+            databases = self.athena_client.list_databases(CatalogName='AwsDataCatalog')
             db_names = [db['Name'] for db in databases['DatabaseList']]
             print(f"Found databases: {', '.join(db_names)}")
             
@@ -1036,7 +1041,7 @@ class AwsLangChainBot:
                         for table in table_names[:3]:  # Check first 3 tables
                             try:
                                 count_query = f"SELECT COUNT(*) as row_count FROM {db}.{table}"
-                                result = self.run_athena_query(count_query, database=db)
+                                result = self.run_athena_query(count_query, database=db, catalog_name='AwsDataCatalog')
                                 if result is not None and not result.empty:
                                     row_count = result['row_count'].iloc[0]
                                     print(f"- Table {db}.{table} has {row_count} rows")
@@ -1044,7 +1049,7 @@ class AwsLangChainBot:
                                     if int(row_count) > 0:
                                         # Get a preview of the data
                                         preview_query = f"SELECT * FROM {db}.{table} LIMIT 2"
-                                        preview = self.run_athena_query(preview_query, database=db)
+                                        preview = self.run_athena_query(preview_query, database=db, catalog_name='AwsDataCatalog')
                                         if preview is not None and not preview.empty:
                                             print(f"- Preview of {db}.{table}:")
                                             print(preview.head(2))
