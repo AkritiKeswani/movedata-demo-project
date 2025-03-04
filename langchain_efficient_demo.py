@@ -394,9 +394,6 @@ class AwsLangChainBot:
                     else:
                         print("⚠️ OAuth refresh failed. Using sample documents for testing.")
                         aws_available = False
-                else:
-                    print("⚠️ AWS clients not available. Using sample documents for testing.")
-                    aws_available = False
             
             if aws_available:
                 # Check if the required tables exist
@@ -514,7 +511,7 @@ class AwsLangChainBot:
                 )
                 documents.append(doc)
             
-            # Process contacts
+            # Process contacts - Enhance with better company name normalization
             print(f"🔄 Processing {len(contacts_df)} contacts...")
             for i, row in contacts_df.iterrows():
                 # Try to find name fields with different possible column names
@@ -530,18 +527,42 @@ class AwsLangChainBot:
                         last_name = row.get(col)
                         break
                 
+                # Extract company with more variations and normalize
+                company = None
+                for col in ['Company', 'company', 'CompanyName', 'company_name', 'AccountName', 'account_name', 'Account']:
+                    if col in contacts_df.columns and row.get(col):
+                        company = str(row.get(col)).strip().lower()
+                        break
+                
+                # Normalize company names (handle variations like "Inc", "Inc.", "Incorporated")
+                if company:
+                    # Remove common suffixes for matching
+                    company = company.replace("inc.", "").replace("inc", "").replace("llc", "").replace("llc.", "")
+                    company = company.replace("ltd.", "").replace("ltd", "").replace("limited", "")
+                    company = company.replace("corp.", "").replace("corp", "").replace("corporation", "")
+                    company = company.strip()
+                
                 name = f"{first_name or ''} {last_name or ''}".strip() or f"Contact{i}"
                 
                 content = f"CONTACT: {name}\n"
+                if company:
+                    content += f"Company: {row.get('Company', company)}\n"  # Use original company name in content
+                
                 for col in contacts_df.columns:
                     value = row.get(col, '')
-                    # Skip binary or very large content
-                    if isinstance(value, str) and len(value) < 5000:
+                    # Skip binary or very large content and already processed fields
+                    if isinstance(value, str) and len(value) < 5000 and col not in ['FirstName', 'LastName', 'Company']:
                         content += f"{col}: {value}\n"
                 
                 doc = Document(
                     page_content=content,
-                    metadata={"source": "salesforce", "type": "contact", "id": str(i)}
+                    metadata={
+                        "source": "salesforce", 
+                        "type": "contact", 
+                        "id": str(i),
+                        "company": company,  # Store normalized company for matching
+                        "name": name
+                    }
                 )
                 documents.append(doc)
             
@@ -746,7 +767,7 @@ class AwsLangChainBot:
             return False
     
     def ask(self, question):
-        """Ask a question about the data"""
+        """Ask a question about the data with improved context for relationship queries"""
         if not self.qa_chain:
             print("❌ System not initialized. Call initialize() first.")
             return "System not initialized. Please initialize first."
@@ -754,27 +775,155 @@ class AwsLangChainBot:
         print(f"❓ Question: {question}")
         
         try:
-            # Add more debugging
-            print("Invoking QA chain...")
-            # Get answer
-            result = self.qa_chain.invoke({"question": question})
-            answer = result.get('answer', 'No answer found')
+            # Analyze the question type
+            question_lower = question.lower()
             
-            print(f"✅ Answer: {answer[:100]}...")
-            return answer
+            # Detect relationship and analytical questions
+            is_relationship_query = any(phrase in question_lower for phrase in [
+                "associated with", "related to", "connected to", "linked with",
+                "which company", "which contact", "who works", "employed by"
+            ])
+            
+            is_analytical_query = any(phrase in question_lower for phrase in [
+                "highest", "lowest", "most", "least", "average", "total", 
+                "when did", "effective date", "start date", "end date",
+                "contract fee", "value", "amount", "cost", "price"
+            ])
+            
+            # Get more documents for relationship and analytical queries
+            k_value = 20 if is_relationship_query or is_analytical_query else 10
+            
+            # Get documents with the enhanced retriever
+            docs = self.vector_store.similarity_search(
+                question,
+                k=k_value
+            )
+            
+            # Create context from documents
+            context = "\n\n".join([doc.page_content for doc in docs])
+            
+            # Add detailed data structure guidance based on your actual data
+            data_structure_guidance = """
+            DATA STRUCTURE INFORMATION:
+            
+            1. Salesforce Contacts:
+               - Primary fields: name, email, phone, title
+               - Each contact has a unique ID (_airbyte_generation_id)
+               - Contacts may be associated with companies but this relationship needs to be inferred
+            
+            2. Google Drive Contracts:
+               - Primary fields: company name, effective date, contract fee/value
+               - Contract details include start dates, end dates, and financial terms
+               - Contracts are associated with companies by name
+            
+            3. Relationships:
+               - Contacts and contracts are related through company names
+               - A company may have multiple contacts (employees)
+               - A company may have multiple contracts
+               - Contract effective dates and values can be used for financial analysis
+            """
+            
+            # Create formatting instructions based on question type
+            formatting_instructions = ""
+            
+            if is_relationship_query:
+                formatting_instructions = """
+                Format your response as follows:
+                
+                1. Start with a direct answer to the relationship question.
+                
+                2. For company-contact relationships:
+                   ## Contacts at [Company]
+                   1. [Name]
+                      - Email: [Email]
+                   2. [Next Contact]
+                      ...
+                
+                3. For company-contract relationships:
+                   ## Contracts with [Company]
+                   1. Contract: [Contract Name/ID]
+                      - Effective Date: [Date if available]
+                      - Value: [Amount if available]
+                   2. [Next Contract]
+                      ...
+                
+                Only include information that is present in the context.
+                """
+            elif is_analytical_query:
+                formatting_instructions = """
+                Format your response as follows:
+                
+                1. Start with a direct answer to the analytical question (e.g., "The highest contract value is $X for Company Y").
+                
+                2. Provide supporting details:
+                   ## Analysis Details
+                   - [Key finding 1]
+                   - [Key finding 2]
+                   ...
+                
+                3. If relevant, include a breakdown:
+                   ## Data Breakdown
+                   1. [Company]: [Relevant value/date]
+                   2. [Company]: [Relevant value/date]
+                   ...
+                
+                Be precise with dates, amounts, and numerical values. Only include information that is present in the context.
+                """
+            else:
+                formatting_instructions = """
+                Format your response in a clear, structured way with appropriate headings and bullet points where relevant.
+                
+                For contacts, include:
+                - Name
+                - Email
+                
+                For contracts, include:
+                - Company name
+                - Effective dates (if available)
+                - Contract values (if available)
+                
+                Only include information that is present in the context.
+                """
+            
+            # Create the full prompt
+            custom_prompt = f"""
+            You are an assistant that analyzes relationships between contacts and contracts in a corporate database.
+            
+            {data_structure_guidance}
+            
+            Context information is below.
+            ---------------------
+            {context}
+            ---------------------
+            
+            Given the context information and not prior knowledge, answer this question: {question}
+            
+            {formatting_instructions}
+            
+            If you don't have enough information to answer the question completely, simply state what you know based on the available data without mentioning "Missing Information" explicitly. Never include a "Missing Information" section in your response.
+            """
+            
+            # Use a direct LLM call for better control
+            llm = ChatOpenAI(temperature=0, openai_api_key=self.openai_api_key, model="gpt-4")
+            response = llm.invoke(custom_prompt)
+            
+            # Update memory
+            self.memory.chat_memory.add_user_message(question)
+            self.memory.chat_memory.add_ai_message(response.content)
+            
+            print(f"✅ Response generated for {'relationship' if is_relationship_query else 'analytical' if is_analytical_query else 'standard'} query")
+            return response.content
             
         except Exception as e:
             error_str = str(e).lower()
-            # Check if this is a token expiration error
+            # Error handling code
             if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
                 print("⚠️ AWS token expired. Attempting to refresh via OAuth...")
                 if self.refresh_aws_credentials_oauth():
                     print("✅ Credentials refreshed, retrying query...")
-                    # Retry the question with refreshed credentials
                     return self.ask(question)
                 else:
                     print("❌ OAuth refresh failed.")
-                    return f"Error: AWS credentials expired and could not be refreshed. Please update your credentials."
             else:
                 print(f"❌ Error generating answer: {str(e)}")
                 import traceback
@@ -1304,11 +1453,11 @@ def main():
     
     # Run web app if requested
     if args.webapp:
-        import streamlit
-        # This will use Streamlit's command line interface
-        streamlit.cli.main_run("langchain_efficient_Demo.py", "create_streamlit_app")
+        print("Starting Streamlit web application...")
+        # Don't try to programmatically launch Streamlit
+        print("Please run with: streamlit run langchain_efficient_demo.py")
         return
-        
+    
     # Command-line mode
     bot = AwsLangChainBot()
     
