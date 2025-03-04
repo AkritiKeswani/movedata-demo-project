@@ -1,0 +1,9 @@
+streamlit
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-core>=0.1.10
+python-dotenv
+pandas
+boto3
+openai>=1.6.1
+faiss-cpu 
