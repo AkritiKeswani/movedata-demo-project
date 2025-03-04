@@ -8,6 +8,8 @@ import hashlib
 import pickle
 import os.path
 import warnings
+import requests
+from datetime import datetime, timedelta
 
 # LangChain imports
 from langchain_openai import OpenAIEmbeddings
@@ -43,15 +45,16 @@ class AwsLangChainBot:
         self.aws_region = os.getenv("AWS_REGION", "us-east-1")
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         
-        # Initialize AWS clients
-        try:
-            self.initialize_aws_clients()
-        except Exception as e:
-            if "AWS credentials expired" in str(e):
-                print("⚠️ AWS credentials appear to be expired. Using sample data instead.")
-                # Don't initialize AWS clients, we'll use sample data
-            else:
-                raise
+        # OAuth refresh configuration
+        self.aws_refresh_token = os.getenv("AWS_REFRESH_TOKEN")
+        self.aws_client_id = os.getenv("AWS_CLIENT_ID")
+        self.aws_client_secret = os.getenv("AWS_CLIENT_SECRET")
+        self.aws_token_url = os.getenv("AWS_TOKEN_URL", "https://api.aws.amazon.com/oauth2/token")
+        
+        # Initialize AWS clients flag - we'll initialize them later
+        self.aws_clients_initialized = False
+        self.athena_client = None
+        self.s3_client = None
         
         # Initialize LangChain components with updated imports
         self.embeddings = OpenAIEmbeddings(openai_api_key=self.openai_api_key)
@@ -64,7 +67,7 @@ class AwsLangChainBot:
         self.query_cache = self.load_query_cache()
     
     def initialize_aws_clients(self):
-        """Initialize AWS clients with current credentials"""
+        """Initialize AWS clients with current credentials and handle token refresh"""
         try:
             session = boto3.Session(
                 aws_access_key_id=self.aws_access_key_id,
@@ -80,16 +83,26 @@ class AwsLangChainBot:
             try:
                 self.athena_client.list_data_catalogs()
                 print("✅ AWS credentials are valid")
+                self.aws_clients_initialized = True
+                return True
             except Exception as e:
                 error_str = str(e).lower()
                 if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
                     print("⚠️ AWS token expired during validation.")
-                    raise Exception("AWS credentials expired. Please refresh your token.")
+                    # Attempt to refresh using OAuth
+                    if self.refresh_aws_credentials_oauth():
+                        print("✅ Credentials refreshed automatically via OAuth")
+                        # Already re-initialized clients in refresh method
+                        return True
+                    else:
+                        self.aws_clients_initialized = False
+                        raise Exception("AWS credentials expired and refresh failed. Please refresh your token.")
                 else:
                     raise
             
         except Exception as e:
             print(f"❌ Error initializing AWS clients: {e}")
+            self.aws_clients_initialized = False
             raise Exception(f"Failed to initialize AWS clients. Please check your credentials: {str(e)}")
     
     def refresh_aws_credentials(self, access_key=None, secret_key=None, session_token=None):
@@ -117,6 +130,96 @@ class AwsLangChainBot:
             print(f"❌ Error refreshing AWS credentials: {e}")
             return False
     
+    def refresh_aws_credentials_oauth(self, refresh_token=None):
+        """Refresh AWS credentials using OAuth refresh token"""
+        # Use provided refresh token or the one stored in environment
+        refresh_token = refresh_token or os.getenv("AWS_REFRESH_TOKEN")
+        
+        if not refresh_token:
+            print("❌ No refresh token available. Please provide a refresh token.")
+            return False
+        
+        try:
+            print("🔄 Refreshing AWS credentials via OAuth...")
+            
+            # Get the OAuth endpoint from environment or use default
+            oauth_endpoint = os.getenv("AWS_OAUTH_ENDPOINT", "https://api.example.com")
+            client_id = os.getenv("AWS_CLIENT_ID")
+            client_secret = os.getenv("AWS_CLIENT_SECRET")
+            
+            # Make the OAuth refresh token request
+            response = requests.post(
+                f"{oauth_endpoint}/applications/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            if response.status_code != 200:
+                print(f"❌ OAuth refresh failed: {response.status_code} - {response.text}")
+                return False
+            
+            # Parse the response
+            token_data = response.json()
+            
+            # Extract AWS credentials from the token response
+            self.aws_access_key_id = token_data.get("access_key_id")
+            self.aws_secret_access_key = token_data.get("secret_access_key")
+            self.aws_session_token = token_data.get("session_token")
+            
+            # Update environment variables
+            os.environ["AWS_ACCESS_KEY_ID"] = self.aws_access_key_id
+            os.environ["AWS_SECRET_ACCESS_KEY"] = self.aws_secret_access_key
+            os.environ["AWS_SESSION_TOKEN"] = self.aws_session_token
+            
+            # Calculate expiry time (default 1 hour if not specified)
+            expires_in = token_data.get("expires_in", 3600)
+            self.credentials_expiry = datetime.now() + timedelta(seconds=expires_in)
+            
+            # Save the updated credentials
+            self.save_credentials_cache()
+            
+            # Reinitialize AWS clients with new credentials
+            self.initialize_aws_clients()
+            
+            print(f"✅ AWS credentials refreshed via OAuth, valid until {self.credentials_expiry}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error refreshing AWS credentials via OAuth: {str(e)}")
+            return False
+    
+    def update_dotenv_file(self, key, value):
+        """Update a specific key in the .env file"""
+        env_path = '.env'
+        
+        # Read current .env file
+        if os.path.exists(env_path):
+            with open(env_path, 'r') as file:
+                lines = file.readlines()
+        else:
+            lines = []
+        
+        # Check if the key exists and update it
+        key_found = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[i] = f"{key}=\"{value}\"\n"
+                key_found = True
+                break
+        
+        # Add key if not found
+        if not key_found:
+            lines.append(f"{key}=\"{value}\"\n")
+        
+        # Write back to .env file
+        with open(env_path, 'w') as file:
+            file.writelines(lines)
+    
     def load_query_cache(self):
         """Load the query cache from disk if it exists"""
         if os.path.exists(self.query_cache_path):
@@ -141,7 +244,7 @@ class AwsLangChainBot:
         return hashlib.md5(key.encode()).hexdigest()
     
     def run_athena_query(self, query, database="demo"):
-        """Run Athena query and return DataFrame with caching"""
+        """Run Athena query and return DataFrame with caching and automatic OAuth refresh"""
         cache_key = self.get_cache_key(query, database)
         
         # Check if this query is already in cache
@@ -155,6 +258,10 @@ class AwsLangChainBot:
         s3_output_location = os.getenv("ATHENA_OUTPUT_LOCATION", "s3://ab-destination-iceberg/")
         
         try:
+            # Make sure AWS clients are initialized
+            if not self.aws_clients_initialized:
+                self.initialize_aws_clients()
+            
             # Verify the database exists before running the query
             try:
                 databases = self.athena_client.list_databases()
@@ -164,7 +271,12 @@ class AwsLangChainBot:
                     raise Exception(f"Database '{database}' does not exist")
             except Exception as e:
                 if "expired" in str(e).lower() or "token" in str(e).lower() or "credentials" in str(e).lower():
-                    raise Exception("AWS credentials expired. Please refresh your token.")
+                    if self.refresh_aws_credentials_oauth():
+                        print("✅ Credentials refreshed automatically via OAuth")
+                        # Retry the query after refreshing
+                        return self.run_athena_query(query, database)
+                    else:
+                        raise Exception("AWS credentials expired and refresh failed.")
                 raise
             
             # Start the query execution
@@ -192,11 +304,14 @@ class AwsLangChainBot:
                     attempts += 1
                 except Exception as e:
                     error_str = str(e).lower()
-                    # Expanded check for token expiration with more possible error messages
+                    # Check for token expiration with more possible error messages
                     if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
-                        print("⚠️ AWS token expired. Please refresh your credentials.")
-                        # You could add auto-refresh logic here if you have a way to get new tokens
-                        raise Exception("AWS credentials expired. Please refresh your token.")
+                        print("⚠️ AWS token expired during query execution. Attempting to refresh...")
+                        if self.refresh_aws_credentials_oauth():
+                            print("✅ Credentials refreshed, continuing with query...")
+                            continue
+                        else:
+                            raise Exception("AWS credentials expired and refresh failed.")
                     else:
                         raise
             
@@ -211,8 +326,12 @@ class AwsLangChainBot:
             except Exception as e:
                 # Check if it's a token expiration error
                 if "expired" in str(e).lower() or "token" in str(e).lower():
-                    print("⚠️ AWS token expired. Please refresh your credentials.")
-                    raise Exception("AWS credentials expired. Please refresh your token.")
+                    print("⚠️ AWS token expired while getting results. Attempting to refresh...")
+                    if self.refresh_aws_credentials_oauth():
+                        print("✅ Credentials refreshed, retrying...")
+                        return self.run_athena_query(query, database)
+                    else:
+                        raise Exception("AWS credentials expired and refresh failed.")
                 else:
                     raise
             
@@ -232,13 +351,18 @@ class AwsLangChainBot:
             
             return df
         except Exception as e:
-            # Check if it's a token expiration error
-            if "expired" in str(e).lower() or "token" in str(e).lower():
-                print("⚠️ AWS token expired. Please refresh your credentials.")
-                raise Exception("AWS credentials expired. Please refresh your token.")
-            else:
-                print(f"❌ Error executing Athena query: {e}")
-                raise Exception(f"Failed to execute Athena query: {str(e)}")
+            # Check if it's a token expiration error and attempt to refresh
+            if "expired" in str(e).lower() or "token" in str(e).lower() or "credentials" in str(e).lower():
+                print("⚠️ AWS token expired. Attempting to refresh via OAuth...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying query...")
+                    # Retry the query with refreshed credentials
+                    return self.run_athena_query(query, database)
+                else:
+                    print("❌ OAuth refresh failed.")
+            
+            print(f"❌ Error executing Athena query: {e}")
+            raise Exception(f"Failed to execute Athena query: {str(e)}")
     
     def fetch_and_process_data(self):
         """Fetch data from AWS Glue/Athena and convert to Documents for embedding"""
@@ -252,8 +376,22 @@ class AwsLangChainBot:
                 aws_available = True
             except Exception as e:
                 print(f"⚠️ AWS connection error: {str(e)}")
-                print("⚠️ AWS clients not available. Using sample documents for testing.")
-                aws_available = False
+                # Try to refresh credentials
+                if "expired" in str(e).lower() or "token" in str(e).lower():
+                    if self.refresh_aws_credentials_oauth():
+                        print("✅ Credentials refreshed, trying again...")
+                        try:
+                            self.athena_client.list_data_catalogs()
+                            aws_available = True
+                        except Exception as e2:
+                            print(f"⚠️ Still can't connect to AWS after refresh: {str(e2)}")
+                            aws_available = False
+                    else:
+                        print("⚠️ OAuth refresh failed. Using sample documents for testing.")
+                        aws_available = False
+                else:
+                    print("⚠️ AWS clients not available. Using sample documents for testing.")
+                    aws_available = False
             
             if aws_available:
                 # Check if the required tables exist
@@ -274,8 +412,26 @@ class AwsLangChainBot:
                         aws_available = False
                 except Exception as e:
                     print(f"⚠️ Error checking tables: {str(e)}")
-                    print("⚠️ Using sample data instead.")
-                    aws_available = False
+                    # Try to refresh credentials
+                    if "expired" in str(e).lower() or "token" in str(e).lower():
+                        if self.refresh_aws_credentials_oauth():
+                            print("✅ Credentials refreshed, trying again...")
+                            try:
+                                tables = self.athena_client.list_table_metadata(
+                                    CatalogName='AwsDataCatalog',
+                                    DatabaseName='demo'
+                                )
+                                table_names = [table['Name'] for table in tables['TableMetadataList']]
+                                
+                                if 'files' not in table_names or 'contact' not in table_names:
+                                    print("⚠️ Required tables not found. Using sample data instead.")
+                                    aws_available = False
+                            except Exception as e2:
+                                print(f"⚠️ Still can't check tables after refresh: {str(e2)}")
+                                aws_available = False
+                        else:
+                            print("⚠️ OAuth refresh failed. Using sample data instead.")
+                            aws_available = False
                 
                 if aws_available:
                     # Fetch contract data from files table
@@ -531,6 +687,21 @@ class AwsLangChainBot:
                 shutil.rmtree(self.vector_store_path)
                 print("🔄 Deleted existing vector store for refresh")
         
+        # Initialize AWS clients if needed
+        if not self.aws_clients_initialized:
+            try:
+                self.initialize_aws_clients()
+            except Exception as e:
+                print(f"⚠️ AWS initialization error: {str(e)}")
+                # Try to refresh the credentials via OAuth if token expired
+                if "expired" in str(e).lower() or "token" in str(e).lower():
+                    if self.refresh_aws_credentials_oauth():
+                        print("✅ Credentials refreshed via OAuth. Continuing initialization.")
+                    else:
+                        print("⚠️ Could not refresh credentials via OAuth. Will use sample data.")
+                else:
+                    print("⚠️ Will proceed with sample data.")
+        
         # Load or create vector store
         if not self.load_or_create_vector_store():
             print("❌ Failed to initialize vector store")
@@ -544,15 +715,21 @@ class AwsLangChainBot:
             retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
             print(f"Retriever created: {type(retriever)}")
             
-            # Fix: Specify memory_key and output_key properly
+            # Create a custom memory that knows which key to use
+            self.memory = ConversationBufferMemory(
+                memory_key="chat_history", 
+                return_messages=True,
+                output_key="answer"  # This tells memory which output to store
+            )
+            
+            # Create the chain with the updated memory
             self.qa_chain = ConversationalRetrievalChain.from_llm(
                 llm=ChatOpenAI(temperature=0, openai_api_key=self.openai_api_key, model="gpt-4"),
                 retriever=retriever,
                 memory=self.memory,
                 verbose=True,
                 return_source_documents=True,
-                output_key="answer",
-                memory_key="chat_history"  # Make sure this matches the memory's memory_key
+                output_key="answer"
             )
             
             print("✅ Initialization complete - ask questions about contracts and contacts!")
@@ -582,10 +759,22 @@ class AwsLangChainBot:
             return answer
             
         except Exception as e:
-            print(f"❌ Error generating answer: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return f"Error: {str(e)}"
+            error_str = str(e).lower()
+            # Check if this is a token expiration error
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
+                print("⚠️ AWS token expired. Attempting to refresh via OAuth...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying query...")
+                    # Retry the question with refreshed credentials
+                    return self.ask(question)
+                else:
+                    print("❌ OAuth refresh failed.")
+                    return f"Error: AWS credentials expired and could not be refreshed. Please update your credentials."
+            else:
+                print(f"❌ Error generating answer: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return f"Error: {str(e)}"
 
     def explore_data(self):
         """Explore available tables and data in the connected database"""
@@ -631,7 +820,16 @@ class AwsLangChainBot:
             
             return True
         except Exception as e:
-            print(f"Error exploring data: {str(e)}")
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
+                print("⚠️ AWS credentials expired. Attempting to refresh via OAuth...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying operation...")
+                    return self.explore_data()
+                else:
+                    print("❌ Failed to refresh credentials.")
+            else:
+                print(f"Error exploring data: {str(e)}")
             return False
 
     def run_diagnostics(self, database="demo", tables=None):
@@ -648,7 +846,16 @@ class AwsLangChainBot:
             catalogs = self.athena_client.list_data_catalogs()
             print(f"✅ AWS credentials are valid - found {len(catalogs['DataCatalogsSummary'])} data catalogs")
         except Exception as e:
-            print(f"❌ AWS credential check failed: {e}")
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
+                print("⚠️ AWS credentials expired. Attempting to refresh via OAuth...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying diagnostics...")
+                    return self.run_diagnostics(database, tables)
+                else:
+                    print("❌ Failed to refresh credentials.")
+            else:
+                print(f"❌ AWS credential check failed: {e}")
             return False
         
         # Step 2: S3 bucket access check
@@ -685,7 +892,18 @@ class AwsLangChainBot:
             self.s3_client.delete_object(Bucket=bucket, Key=test_key)
             print(f"✅ Successfully deleted test file")
         except Exception as e:
-            print(f"❌ S3 access check failed: {e}")
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied", "not authorized"]):
+                print("⚠️ AWS credentials expired. Attempting to refresh via OAuth...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying S3 check...")
+                    # Rerun just this part
+                    self.run_diagnostics(database, tables)
+                    return True
+                else:
+                    print("❌ Failed to refresh credentials.")
+            else:
+                print(f"❌ S3 access check failed: {e}")
         
         # Step 3: Database existence check
         print(f"\n--- Step 3: Database Check ({database}) ---")
@@ -734,13 +952,37 @@ class AwsLangChainBot:
                                     print("❌ Could not get row count - query failed")
                                     all_tables_ok = False
                             except Exception as e:
-                                print(f"❌ Error counting rows: {e}")
-                                all_tables_ok = False
+                                error_str = str(e).lower()
+                                if any(keyword in error_str for keyword in ["expired", "token", "credentials"]):
+                                    print("⚠️ AWS credentials expired. Attempting to refresh...")
+                                    if self.refresh_aws_credentials_oauth():
+                                        print("✅ Credentials refreshed, retrying query...")
+                                        try:
+                                            result = self.run_athena_query(count_query, database)
+                                            row_count = result['row_count'].iloc[0]
+                                            print(f"✅ Table has {row_count} rows after credential refresh")
+                                        except Exception as e2:
+                                            print(f"❌ Error counting rows after refresh: {e2}")
+                                            all_tables_ok = False
+                                    else:
+                                        print("❌ Failed to refresh credentials.")
+                                        all_tables_ok = False
+                                else:
+                                    print(f"❌ Error counting rows: {e}")
+                                    all_tables_ok = False
                         else:
                             print(f"❌ Table '{table}' not found in database '{database}'")
                             print(f"   Available tables: {', '.join(table_names)}")
                             all_tables_ok = False
                     except Exception as e:
+                        error_str = str(e).lower()
+                        if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied"]):
+                            print("⚠️ AWS credentials expired during table check. Attempting to refresh...")
+                            if self.refresh_aws_credentials_oauth():
+                                print("✅ Credentials refreshed, continuing...")
+                                continue
+                            else:
+                                print("❌ Failed to refresh credentials.")
                         print(f"❌ Error checking table '{table}': {e}")
                         all_tables_ok = False
                 
@@ -753,7 +995,16 @@ class AwsLangChainBot:
                 print(f"   Available databases: {', '.join(db_names)}")
                 return False
         except Exception as e:
-            print(f"❌ Error checking databases: {e}")
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials", "access denied"]):
+                print("⚠️ AWS credentials expired. Attempting to refresh...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying database check...")
+                    return self.run_diagnostics(database, tables)
+                else:
+                    print("❌ Failed to refresh credentials.")
+            else:
+                print(f"❌ Error checking databases: {e}")
             return False
         
         print("\n======= DIAGNOSTICS COMPLETE =======")
@@ -799,15 +1050,51 @@ class AwsLangChainBot:
                                             print(preview.head(2))
                                             print(f"- Columns: {', '.join(preview.columns)}")
                             except Exception as e:
+                                error_str = str(e).lower()
+                                if any(keyword in error_str for keyword in ["expired", "token", "credentials"]):
+                                    print(f"⚠️ AWS credentials expired while accessing {db}.{table}. Attempting to refresh...")
+                                    if self.refresh_aws_credentials_oauth():
+                                        print("✅ Credentials refreshed, continuing...")
+                                        continue
+                                    else:
+                                        print("❌ Failed to refresh credentials.")
+                                        break
                                 print(f"- Error accessing {db}.{table}: {str(e)}")
                     else:
                         print(f"No tables found in database {db}")
                 except Exception as e:
-                    print(f"Error listing tables in {db}: {str(e)}")
+                    error_str = str(e).lower()
+                    if any(keyword in error_str for keyword in ["expired", "token", "credentials"]):
+                        print(f"⚠️ AWS credentials expired while listing tables in {db}. Attempting to refresh...")
+                        if self.refresh_aws_credentials_oauth():
+                            print("✅ Credentials refreshed, retrying...")
+                            try:
+                                tables = self.athena_client.list_table_metadata(
+                                    CatalogName='AwsDataCatalog',
+                                    DatabaseName=db
+                                )
+                                table_names = [table['Name'] for table in tables['TableMetadataList']]
+                                print(f"Tables in {db} after refresh: {', '.join(table_names)}")
+                            except Exception as e2:
+                                print(f"Error listing tables in {db} after refresh: {str(e2)}")
+                        else:
+                            print("❌ Failed to refresh credentials.")
+                            continue
+                    else:
+                        print(f"Error listing tables in {db}: {str(e)}")
             
             return True
         except Exception as e:
-            print(f"Error discovering tables: {str(e)}")
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials"]):
+                print("⚠️ AWS credentials expired. Attempting to refresh...")
+                if self.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed, retrying table discovery...")
+                    return self.discover_tables()
+                else:
+                    print("❌ Failed to refresh credentials.")
+            else:
+                print(f"Error discovering tables: {str(e)}")
             return False
 
 # Streamlit interface
@@ -831,6 +1118,46 @@ def create_streamlit_app():
     
     # Add data inspection tab in sidebar
     st.sidebar.title("Data Tools")
+    
+    # Add AWS authentication section
+    with st.sidebar.expander("AWS Authentication"):
+        st.subheader("Update AWS Credentials")
+        
+        # Show current status
+        if hasattr(st.session_state.bot, 'aws_access_key_id') and st.session_state.bot.aws_access_key_id:
+            st.success(f"AWS Access Key: {st.session_state.bot.aws_access_key_id[:5]}...")
+        else:
+            st.warning("No AWS access key detected")
+            
+        # Option for OAuth refresh
+        st.subheader("OAuth Refresh")
+        refresh_token = st.text_input("AWS Refresh Token (leave empty to use stored token)",
+                                    type="password", key="refresh_token")
+        
+        if st.button("Refresh AWS Credentials via OAuth"):
+            with st.spinner("Refreshing AWS credentials..."):
+                token_to_use = refresh_token if refresh_token else None
+                if st.session_state.bot.refresh_aws_credentials_oauth(token_to_use):
+                    st.success("✅ AWS credentials refreshed successfully via OAuth!")
+                else:
+                    st.error("❌ Failed to refresh AWS credentials via OAuth")
+        
+        # Manual credential update option
+        st.subheader("Manual Credential Update")
+        access_key = st.text_input("AWS Access Key ID", type="password", key="access_key")
+        secret_key = st.text_input("AWS Secret Access Key", type="password", key="secret_key")
+        session_token = st.text_input("AWS Session Token", type="password", key="session_token")
+        
+        if st.button("Update AWS Credentials Manually"):
+            with st.spinner("Updating AWS credentials..."):
+                if st.session_state.bot.refresh_aws_credentials(
+                    access_key=access_key if access_key else None,
+                    secret_key=secret_key if secret_key else None,
+                    session_token=session_token if session_token else None
+                ):
+                    st.success("✅ AWS credentials updated successfully!")
+                else:
+                    st.error("❌ Failed to update AWS credentials")
     
     # Add database explorer
     if st.sidebar.button("Explore Databases"):
@@ -860,7 +1187,18 @@ def create_streamlit_app():
                             count_df = st.session_state.bot.run_athena_query(f"SELECT COUNT(*) as row_count FROM {selected_db}.{selected_table}", database=selected_db)
                             st.write(f"Total rows: {count_df['row_count'].iloc[0]}")
         except Exception as e:
-            st.sidebar.error(f"Error exploring databases: {str(e)}")
+            # Check if this is a token expiration error
+            if "expired" in str(e).lower() or "token" in str(e).lower() or "credentials" in str(e).lower():
+                st.sidebar.error("AWS credentials expired. Please refresh your token in the AWS Authentication section.")
+                # Try automatic refresh
+                with st.spinner("Attempting automatic OAuth refresh..."):
+                    if st.session_state.bot.refresh_aws_credentials_oauth():
+                        st.sidebar.success("✅ AWS credentials refreshed automatically!")
+                        st.experimental_rerun()  # Rerun the app to reflect changes
+                    else:
+                        st.sidebar.error("❌ Automatic refresh failed. Please refresh manually.")
+            else:
+                st.sidebar.error(f"Error exploring databases: {str(e)}")
     
     if st.sidebar.button("Refresh Data"):
         with st.spinner("Refreshing data..."):
@@ -883,7 +1221,18 @@ def create_streamlit_app():
                 with st.expander("Contacts Data (contact table)"):
                     st.dataframe(contacts_df)
         except Exception as e:
-            st.error(f"Error fetching data: {str(e)}")
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["expired", "token", "credentials"]):
+                st.error("AWS credentials expired. Please refresh your token in the AWS Authentication section.")
+                # Try automatic refresh
+                with st.spinner("Attempting automatic OAuth refresh..."):
+                    if st.session_state.bot.refresh_aws_credentials_oauth():
+                        st.success("✅ AWS credentials refreshed automatically!")
+                        st.experimental_rerun()  # Rerun the app to reflect changes
+                    else:
+                        st.error("❌ Automatic refresh failed. Please refresh manually.")
+            else:
+                st.error(f"Error fetching data: {str(e)}")
     
     # Chat history
     if 'messages' not in st.session_state:
@@ -906,11 +1255,32 @@ def create_streamlit_app():
         # Generate response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = st.session_state.bot.ask(question)
-                st.markdown(response)
-        
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
+                try:
+                    response = st.session_state.bot.ask(question)
+                    st.markdown(response)
+                    
+                    # Add assistant response to chat history
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                except Exception as e:
+                    error_message = str(e)
+                    
+                    # Check if this is a token expiration error
+                    if any(keyword in error_message.lower() for keyword in ["expired", "token", "credentials"]):
+                        st.error("AWS credentials expired. Attempting automatic refresh...")
+                        # Try automatic refresh
+                        if st.session_state.bot.refresh_aws_credentials_oauth():
+                            st.success("✅ AWS credentials refreshed automatically! Retrying your question...")
+                            try:
+                                response = st.session_state.bot.ask(question)
+                                st.markdown(response)
+                                # Add assistant response to chat history
+                                st.session_state.messages.append({"role": "assistant", "content": response})
+                            except Exception as retry_e:
+                                st.error(f"Error after credential refresh: {str(retry_e)}")
+                        else:
+                            st.error("❌ Automatic refresh failed. Please refresh your token in the AWS Authentication section.")
+                    else:
+                        st.error(f"Error: {error_message}")
 
 # Command-line interface
 def main():
@@ -924,24 +1294,83 @@ def main():
     parser.add_argument('--database', type=str, default="demo", help='Database to query (default: demo)')
     parser.add_argument('--diagnose', action='store_true', help='Run diagnostics on AWS connection')
     parser.add_argument('--discover', action='store_true', help='Discover available tables in AWS')
+    parser.add_argument('--oauth-refresh', type=str, help='Refresh AWS credentials using OAuth refresh token', nargs='?', const='')
     args = parser.parse_args()
     
+    # Run web app if requested
+    if args.webapp:
+        import streamlit
+        # This will use Streamlit's command line interface
+        streamlit.cli.main_run("langchain_efficient_Demo.py", "create_streamlit_app")
+        return
+        
     # Command-line mode
     bot = AwsLangChainBot()
     
+    # Process OAuth refresh if requested
+    if args.oauth_refresh is not None:
+        print("\n=== AWS OAuth Refresh ===")
+        refresh_token = args.oauth_refresh if args.oauth_refresh else None
+        
+        if bot.refresh_aws_credentials_oauth(refresh_token):
+            print("✅ AWS credentials refreshed successfully via OAuth!")
+            return
+        else:
+            print("❌ Failed to refresh AWS credentials via OAuth")
+            return
+    
     # Run diagnostics if requested
     if args.diagnose:
+        # Initialize AWS clients first
+        try:
+            bot.initialize_aws_clients()
+        except Exception as e:
+            # If credentials are expired, try OAuth refresh
+            if "expired" in str(e).lower() or "token" in str(e).lower():
+                print("⚠️ AWS credentials expired. Attempting OAuth refresh...")
+                if bot.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed automatically!")
+                else:
+                    print("❌ OAuth refresh failed. Running with sample data.")
+        
         bot.run_diagnostics()
         return
     
     # Discover tables if requested
     if args.discover:
+        # Initialize AWS clients first
+        try:
+            bot.initialize_aws_clients()
+        except Exception as e:
+            # If credentials are expired, try OAuth refresh
+            if "expired" in str(e).lower() or "token" in str(e).lower():
+                print("⚠️ AWS credentials expired. Attempting OAuth refresh...")
+                if bot.refresh_aws_credentials_oauth():
+                    print("✅ Credentials refreshed automatically!")
+                else:
+                    print("❌ OAuth refresh failed. Running with sample data.")
+        
         bot.discover_tables()
         return
     
     # If direct query mode is requested
     if args.query:
         try:
+            # Initialize AWS clients first
+            try:
+                bot.initialize_aws_clients()
+            except Exception as e:
+                # If credentials are expired, try OAuth refresh
+                if "expired" in str(e).lower() or "token" in str(e).lower():
+                    print("⚠️ AWS credentials expired. Attempting OAuth refresh...")
+                    if bot.refresh_aws_credentials_oauth():
+                        print("✅ Credentials refreshed automatically!")
+                    else:
+                        print("❌ OAuth refresh failed. Cannot run query.")
+                        return
+                else:
+                    raise
+            
             print(f"Running query: {args.query}")
             result_df = bot.run_athena_query(args.query, database=args.database)
             print("\nQuery Results:")
@@ -956,17 +1385,30 @@ def main():
     # Test AWS connection if not explicitly in test mode
     if not args.test:
         try:
-            bot.athena_client.list_data_catalogs()
+            bot.initialize_aws_clients()
             print("✅ AWS Connection: Active")
         except Exception as e:
             if "expired" in str(e).lower() or "token" in str(e).lower():
-                print("⚠️ AWS token expired. Please update your session token.")
-                session_token = input("Enter new AWS Session Token: ")
-                if bot.refresh_aws_credentials(session_token=session_token):
-                    print("✅ AWS session token updated successfully!")
+                print("⚠️ AWS token expired. Attempting OAuth refresh...")
+                
+                if bot.refresh_aws_credentials_oauth():
+                    print("✅ AWS credentials refreshed automatically via OAuth!")
                 else:
-                    print("❌ Failed to update token. Running with sample data instead.")
-                    print("💡 Use --test flag to suppress this warning")
+                    print("⚠️ OAuth refresh failed. Would you like to:")
+                    print("1. Enter AWS credentials manually")
+                    print("2. Run with sample data")
+                    choice = input("Choose an option (1/2): ")
+                    
+                    if choice == '1':
+                        session_token = input("Enter new AWS Session Token: ")
+                        if bot.refresh_aws_credentials(session_token=session_token):
+                            print("✅ AWS session token updated successfully!")
+                        else:
+                            print("❌ Failed to update token. Running with sample data instead.")
+                            print("💡 Use --test flag to suppress this warning")
+                    else:
+                        print("Running with sample data instead.")
+                        print("💡 Use --test flag to suppress this warning")
             else:
                 print(f"❌ AWS Connection Failed: {str(e)}")
                 print("⚠️ Running with sample data instead")
@@ -983,6 +1425,7 @@ def main():
     print("\nAsk questions about contracts from Google Drive and contacts from Salesforce")
     print("Type 'exit' to quit, 'refresh' to update the vector store")
     print("Type 'token' to refresh just the AWS session token")
+    print("Type 'oauth' to refresh using OAuth")
     print("Type 'sql: YOUR QUERY' to run a direct SQL query")
     print("Type 'explore' to explore available databases and tables")
     print("Type 'diagnose' to run AWS diagnostics")
@@ -1004,6 +1447,16 @@ def main():
             
             if bot.refresh_aws_credentials(session_token=session_token):
                 print("✅ AWS session token updated successfully!")
+            continue
+        elif question.lower() == 'oauth':
+            # Refresh using OAuth
+            print("\n--- Refresh AWS Credentials using OAuth ---")
+            refresh_token = input("Enter AWS refresh token (leave empty to use stored token): ")
+            
+            if bot.refresh_aws_credentials_oauth(refresh_token if refresh_token else None):
+                print("✅ AWS credentials refreshed successfully via OAuth!")
+            else:
+                print("❌ Failed to refresh AWS credentials via OAuth")
             continue
         elif question.lower().startswith('sql:'):
             # Direct SQL query mode
@@ -1033,12 +1486,24 @@ def main():
             print(f"\nAnswer: {answer}")
         except Exception as e:
             if "expired" in str(e).lower() and "token" in str(e).lower():
-                print("⚠️ AWS token expired during query. Please update your session token.")
-                session_token = input("Enter new AWS Session Token: ")
-                if bot.refresh_aws_credentials(session_token=session_token):
-                    print("✅ AWS session token updated successfully! Please try your question again.")
+                print("⚠️ AWS token expired during query. Attempting OAuth refresh...")
+                if bot.refresh_aws_credentials_oauth():
+                    print("✅ AWS credentials refreshed automatically via OAuth! Please try your question again.")
+                    try:
+                        # Retry the question with fresh credentials
+                        answer = bot.ask(question)
+                        print(f"\nAnswer: {answer}")
+                    except Exception as retry_e:
+                        print(f"Error after credential refresh: {str(retry_e)}")
                 else:
-                    print("❌ Failed to update token.")
+                    print("❌ OAuth refresh failed.")
+                    print("Would you like to update your AWS session token manually? (y/n)")
+                    if input().lower() == 'y':
+                        session_token = input("Enter new AWS Session Token: ")
+                        if bot.refresh_aws_credentials(session_token=session_token):
+                            print("✅ AWS session token updated successfully! Please try your question again.")
+                        else:
+                            print("❌ Failed to update token.")
             else:
                 print(f"Error: {str(e)}")
 
