@@ -8,3 +8,5 @@ boto3
 openai>=1.6.1
 faiss-cpu 
 tiktoken
+fastmcp>=0.1.0
+tabulate

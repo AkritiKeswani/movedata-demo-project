@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 class AwsLangChainBot:
     def __init__(self, cache_dir="./cache"):
-        print("Initializing AWS Data Chat...")
+        print("Initializing Airbyte Data Chat...")
         
         # Configuration
         self.cache_dir = cache_dir
@@ -1256,12 +1256,12 @@ def create_streamlit_app():
     import streamlit as st
     
     st.set_page_config(
-        page_title="AWS Data Chatbot",
+        page_title="Airbyte Data Chatbot",
         page_icon="🤖",
         layout="wide"
     )
     
-    st.title("🤖 AWS Data Chatbot")
+    st.title("🤖 Airbyte Data Chatbot")
     st.subheader("Ask questions about your contracts and contacts")
     
     # Initialize bot in session state
@@ -1440,7 +1440,7 @@ def create_streamlit_app():
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="AWS Data Chatbot")
+    parser = argparse.ArgumentParser(description="Airbyte Data Chatbot")
     parser.add_argument('--webapp', action='store_true', help='Run the web app')
     parser.add_argument('--refresh', action='store_true', help='Force refresh of the vector store')
     parser.add_argument('--test', action='store_true', help='Run with sample data (no AWS needed)')
@@ -1534,7 +1534,7 @@ def main():
             print(f"Error running query: {str(e)}")
             return
     
-    print("\n===== AWS Data Chatbot =====")
+    print("\n===== Airbyte Data Chatbot =====")
     
     # Test AWS connection if not explicitly in test mode
     if not args.test:
@@ -1577,13 +1577,8 @@ def main():
         return
     
     print("\nAsk questions about contracts from Google Drive and contacts from Salesforce")
-    print("Type 'exit' to quit, 'refresh' to update the vector store")
-    print("Type 'token' to refresh just the AWS session token")
-    print("Type 'oauth' to refresh using OAuth")
-    print("Type 'sql: YOUR QUERY' to run a direct SQL query")
-    print("Type 'explore' to explore available databases and tables")
-    print("Type 'diagnose' to run AWS diagnostics")
-    print("Type 'discover' to discover available tables")
+    print("\n++ 🐙Powered by Airbyte 🐙 ++")
+    
     
     while True:
         question = input("\nQuestion: ")
